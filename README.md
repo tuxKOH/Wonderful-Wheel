@@ -1,63 +1,76 @@
-# WWheel 转盘 App
+# Wonderful Wheel
 
-一个本地桌面转盘应用，使用 Java Swing 实现，无需额外依赖。
+为剧情创作设计的 Android 转盘应用。
+
+> 核心功能：**真实权重与显示权重分离**。扇区展示大小可以与实际抽选概率不同，适合剧情向二创、直播和录播。
+
+## 界面
+
+<p align="center">
+  <img src="docs/screenshots/main.png" alt="转盘主界面" width="320">
+  <img src="docs/screenshots/editor.png" alt="转盘编辑界面" width="320">
+</p>
 
 ## 功能
 
-- 显示转盘和选项名字
-- 真权重影响扇区大小和选中概率
-- 假权重可填写；不填写时显示为真权重，不参与抽选
-- 经过选项播放 tick 音效，选中后播放选中音效
-- 选中后调用系统 TTS 播放结果
-- 可调旋转时长、配色、字体大小
-- 转盘列表、搜索；标题匹配权重高于选项匹配
-- 分组和嵌套子分组
-- PWH 导入
-- WWD 完整导入/导出
-- PWH 兼容导出（会舍弃分组、设置、假权重等 PWH 不支持的功能）
+- **真实权重与显示权重**：真实权重控制抽选概率，显示权重只控制扇区大小；显示权重留空时与真实权重一致。
+- **旋转动画**：带缓动曲线，旋转时长 1–30 秒可调。
+- **音效反馈**：经过选项时播放提示音，选中后播放确认音。
+- **系统 TTS**：选中后自动语音播报结果。
+- **自定义显示**：支持多种配色、字体大小和文字布局设置。
+- **转盘管理**：支持嵌套分组、搜索、编辑和选项拖动排序。
+- **导入与导出**：支持社区 PWH 格式和完整保留应用数据的 WWD 格式。
+- **本地存储**：数据保存在应用私有存储中，无需网络和存储权限。
 
 ## 构建
 
-```bash
-./build.sh
-```
-
-## 运行
+需要 JDK 17 或更高版本，以及包含 Android SDK 36 的 Android SDK 环境。
 
 ```bash
-java -jar build/wwheel.jar
+./gradlew :app:assembleDebug
 ```
 
-数据默认保存到：
+生成的安装包位于：
 
 ```text
-~/.local/share/wwheel/library.wwd.json
+app/build/outputs/apk/debug/app-debug.apk
+```
+
+## 安装与运行
+
+连接 Android 设备或启动模拟器后执行：
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.wheel.app/com.wheel.app.android.MainActivity
+```
+
+运行本地单元测试：
+
+```bash
+./gradlew :app:testDebugUnitTest
 ```
 
 ## 选项输入格式
 
-新建/编辑转盘时，每行一个选项：
+新建或编辑转盘时，每行一个选项：
 
-```text
+```
 名字,真权重,假权重
 ```
 
-假权重可以留空：
+假权重可留空：
 
-```text
-选项 A,1,
-选项 B,3,10
+```
+起床,1,10
+出门,3,
+探索,2,5
+战斗,4,
 ```
 
 ## PWH 格式
 
-PWH 文件格式为：
-
-```text
-ASCII "pwh" + gzip(json)
-```
-
-导入时支持形如：
+文件结构：`pwh` (3 字节) + gzip(JSON)。导入时支持的 JSON 结构：
 
 ```json
 {
@@ -67,11 +80,20 @@ ASCII "pwh" + gzip(json)
     {
       "dbId": 1,
       "items": [
-        {"text": "1"},
-        {"text": "2", "weight": 12}
+        {"text": "选项 A"},
+        {"text": "选项 B", "weight": 12}
       ],
-      "title": "1"
+      "title": "示例转盘"
     }
   ]
 }
 ```
+
+PWH 导出会舍弃分组、假权重等该格式不支持的数据。
+
+## WWD 格式
+
+原生格式，纯 JSON 或 `wwd` + gzip(JSON)。完整包含：
+- 分组结构和嵌套子分组
+- 每个转盘的设置（配色、旋转时长、音效开关、字体大小）
+- 所有选项的真权重和假权重
