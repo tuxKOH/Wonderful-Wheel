@@ -23,9 +23,12 @@ public final class SmokeTest {
 
         WheelLibrary library = new WheelLibrary();
         library.wheels.add(wheel);
+        SpinHistoryEntry history = new SpinHistoryEntry(); history.wheelId = wheel.id; history.wheelName = wheel.name; history.optionId = wheel.options.get(0).id; history.optionText = "A"; history.createdAt = 123; library.history.add(history);
         byte[] wwd = WheelFormats.exportWwd(library, false);
+        if (wwd.length == 0 || wwd[0] != '{') throw new AssertionError("WWD should remain plain JSON");
         WheelLibrary restored = WheelFormats.importWwd(wwd);
         if (restored.wheels.size() != 1 || restored.wheels.get(0).options.get(1).fakeWeight == null) throw new AssertionError("WWD round trip failed");
+        if (restored.history.size() != 1 || !"A".equals(restored.history.get(0).optionText)) throw new AssertionError("WWD history round trip failed");
 
         byte[] pwh = WheelFormats.exportPwh(library.wheels);
         List<Wheel> pwhRestored = WheelFormats.importPwh(pwh, null);

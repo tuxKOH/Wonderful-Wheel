@@ -20,6 +20,7 @@ public final class Models {
         public String text = "";
         public double trueWeight = 1.0;
         public Double fakeWeight;
+        public boolean hidden;
 
         public WheelOption() {}
 
@@ -29,9 +30,8 @@ public final class Models {
             this.fakeWeight = fakeWeight;
         }
 
-        public double displayWeight() {
-            return fakeWeight == null ? trueWeight : fakeWeight;
-        }
+        public double displayWeight() { return fakeWeight == null ? trueWeight : fakeWeight; }
+        public boolean eligible() { return !hidden && trueWeight > 0 && displayWeight() > 0; }
     }
 
     public static final class WheelSettings {
@@ -84,10 +84,20 @@ public final class Models {
         public boolean ellipsizeText = false;
     }
 
+    public static final class SpinHistoryEntry {
+        public String id = newId();
+        public String wheelId;
+        public String wheelName = "";
+        public String optionId;
+        public String optionText = "";
+        public long createdAt = nowMs();
+    }
+
     public static final class WheelLibrary {
-        public int version = 1;
+        public int version = 3;
         public List<Wheel> wheels = new ArrayList<>();
         public List<WheelGroup> groups = new ArrayList<>();
+        public List<SpinHistoryEntry> history = new ArrayList<>();
         public AppSettings settings = new AppSettings();
 
         public String uniqueWheelName(String base) {

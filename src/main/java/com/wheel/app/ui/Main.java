@@ -2,6 +2,7 @@ package com.wheel.app.ui;
 
 import com.wheel.app.audio.AudioService;
 import com.wheel.app.format.WheelFormats;
+import com.wheel.app.model.Models;
 import com.wheel.app.model.Models.*;
 import com.wheel.app.search.WheelSearch;
 import com.wheel.app.spin.SpinEngine;
@@ -232,6 +233,7 @@ public final class Main {
         SpinEngine.SpinPlan plan = spinEngine.createPlan(selectedWheel);
         wheelCanvas.spin(plan, option -> { if (selectedWheel.settings.tickSoundEnabled) audio.tick(); }, () -> {
             status.setText("选中：" + plan.target().text);
+            SpinHistoryEntry entry = new SpinHistoryEntry(); entry.wheelId = selectedWheel.id; entry.wheelName = selectedWheel.name; entry.optionId = plan.target().id; entry.optionText = plan.target().text; library.history.add(entry); save();
             if (selectedWheel.settings.selectedSoundEnabled) audio.selected();
             if (selectedWheel.settings.ttsEnabled) tts.speak(plan.target().text);
         });
@@ -245,9 +247,32 @@ public final class Main {
     }
 
     private void importPwh(ActionEvent e) { importFile("pwh", file -> WheelFormats.importPwh(Files.readAllBytes(file.toPath()), selectedGroupId).forEach(w -> { w.name = library.uniqueWheelName(w.name); library.wheels.add(w); })); }
-    private void importWwd(ActionEvent e) { importFile("wwd/json", file -> { WheelLibrary imported = WheelFormats.importWwd(Files.readAllBytes(file.toPath())); library.groups.addAll(imported.groups); library.wheels.addAll(imported.wheels); }); }
+    private void importWwd(ActionEvent e) { importFile("wwd/json", file -> { WheelLibrary imported = WheelFormats.importWwd(Files.readAllBytes(file.toPath())); mergeWwd(imported); }); }
     private void exportPwh(ActionEvent e) { exportFile("pwh", "export.pwh", file -> Files.write(file.toPath(), WheelFormats.exportPwh(selectedWheel == null ? library.wheels : List.of(selectedWheel)))); }
-    private void exportWwd(ActionEvent e) { exportFile("wwd", "export.wwd.json", file -> Files.write(file.toPath(), WheelFormats.exportWwd(library, false))); }
+    private void exportWwd(ActionEvent e) { exportFile("wwd", "export.wwd", file -> Files.write(file.toPath(), WheelFormats.exportWwd(library, false))); }
+
+    private void mergeWwd(WheelLibrary imported) {
+        Set<String> usedGroupIds = new HashSet<>();
+        for (WheelGroup group : library.groups) usedGroupIds.add(group.id);
+        Map<String, String> groupIds = new HashMap<>();
+        for (WheelGroup group : imported.groups) {
+            String oldId = group.id;
+            if (usedGroupIds.contains(group.id)) group.id = Models.newId();
+            usedGroupIds.add(group.id); groupIds.putIfAbsent(oldId, group.id);
+        }
+        for (WheelGroup group : imported.groups) if (groupIds.containsKey(group.parentId)) group.parentId = groupIds.get(group.parentId);
+        for (Wheel wheel : imported.wheels) if (groupIds.containsKey(wheel.groupId)) wheel.groupId = groupIds.get(wheel.groupId);
+        Set<String> usedWheelIds = new HashSet<>();
+        for (Wheel wheel : library.wheels) usedWheelIds.add(wheel.id);
+        Map<String, String> wheelIds = new HashMap<>();
+        for (Wheel wheel : imported.wheels) {
+            String oldId = wheel.id;
+            if (usedWheelIds.contains(wheel.id)) wheel.id = Models.newId();
+            usedWheelIds.add(wheel.id); wheelIds.putIfAbsent(oldId, wheel.id);
+        }
+        for (SpinHistoryEntry entry : imported.history) if (wheelIds.containsKey(entry.wheelId)) entry.wheelId = wheelIds.get(entry.wheelId);
+        library.groups.addAll(imported.groups); library.wheels.addAll(imported.wheels); library.history.addAll(imported.history);
+    }
 
     private interface FileAction { void run(File file) throws Exception; }
     private void importFile(String ext, FileAction action) {

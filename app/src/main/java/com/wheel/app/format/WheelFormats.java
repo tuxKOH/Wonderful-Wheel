@@ -19,7 +19,7 @@ public final class WheelFormats {
         }
         String json;
         try (GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(raw, 3, raw.length - 3))) {
-            json = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            json = new String(readAll(in), StandardCharsets.UTF_8);
         }
         Object root = SimpleJson.parse(json);
         if (!(root instanceof Map<?, ?> map)) throw new IOException("PWH JSON 顶层不是对象");
@@ -58,6 +58,7 @@ public final class WheelFormats {
             wm.put("title", wheel.name);
             List<Object> items = new ArrayList<>();
             for (WheelOption option : wheel.options) {
+                if(option.hidden||option.trueWeight<=0||option.displayWeight()<=0)continue;
                 Map<String, Object> im = new LinkedHashMap<>();
                 im.put("text", option.text);
                 im.put("weight", option.trueWeight);
@@ -105,8 +106,10 @@ public final class WheelFormats {
                         WheelOption opt = new WheelOption();
                         opt.id = str(om.get("id"), opt.id);
                         opt.text = str(om.get("text"), "");
-                        opt.trueWeight = positive(num(om.get("trueWeight"), 1.0), 1.0);
-                        opt.fakeWeight = om.containsKey("fakeWeight") && om.get("fakeWeight") != null ? positive(num(om.get("fakeWeight"), opt.trueWeight), opt.trueWeight) : null;
+                        opt.trueWeight = nonNegative(num(om.get("trueWeight"), 1.0), 1.0);
+                        opt.fakeWeight = om.containsKey("fakeWeight") && om.get("fakeWeight") != null ? nonNegative(num(om.get("fakeWeight"), opt.trueWeight), opt.trueWeight) : null;
+                        if (om.get("hidden") instanceof Boolean b) opt.hidden=b;
+                        if(opt.trueWeight==0||opt.displayWeight()==0)opt.hidden=true;
                         if (!opt.text.isBlank()) w.options.add(opt);
                     }
                 }
@@ -114,6 +117,22 @@ public final class WheelFormats {
             }
         }
         if (map.get("settings") instanceof Map<?, ?> sm) readAppSettings(library.settings, sm);
+        Object historyObj = map.get("history");
+        if (historyObj instanceof List<?> history) {
+            for (Object hObj : history) if (hObj instanceof Map<?, ?> hm) {
+                String wheelId = nullableStr(hm.get("wheelId"));
+                String optionText = str(hm.get("optionText"), "");
+                if (wheelId == null || wheelId.trim().isEmpty() || optionText.trim().isEmpty()) continue;
+                SpinHistoryEntry entry = new SpinHistoryEntry();
+                entry.id = str(hm.get("id"), entry.id);
+                entry.wheelId = wheelId;
+                entry.wheelName = str(hm.get("wheelName"), "");
+                entry.optionId = nullableStr(hm.get("optionId"));
+                entry.optionText = optionText;
+                entry.createdAt = longNum(hm.get("createdAt"), 0);
+                library.history.add(entry);
+            }
+        }
         for (Wheel w : library.wheels) normalizeSettings(w.settings);
         return library;
     }
@@ -134,6 +153,14 @@ public final class WheelFormats {
         List<Object> wheels = new ArrayList<>();
         for (Wheel w : library.wheels) wheels.add(wheelMap(w));
         root.put("wheels", wheels);
+        List<Object> history = new ArrayList<>();
+        for (SpinHistoryEntry entry : library.history) {
+            Map<String, Object> hm = new LinkedHashMap<>();
+            hm.put("id", entry.id); hm.put("wheelId", entry.wheelId); hm.put("wheelName", entry.wheelName);
+            hm.put("optionId", entry.optionId); hm.put("optionText", entry.optionText); hm.put("createdAt", entry.createdAt);
+            history.add(hm);
+        }
+        root.put("history", history);
         byte[] json = SimpleJson.stringify(root).getBytes(StandardCharsets.UTF_8);
         if (!compressed) return json;
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -145,7 +172,7 @@ public final class WheelFormats {
     private static String decodeMaybeCompressed(byte[] raw, String magic) throws IOException {
         if (raw.length >= 4 && raw[0] == magic.charAt(0) && raw[1] == magic.charAt(1) && raw[2] == magic.charAt(2)) {
             try (GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(raw, 3, raw.length - 3))) {
-                return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+                return new String(readAll(in), StandardCharsets.UTF_8);
             }
         }
         return new String(raw, StandardCharsets.UTF_8);
@@ -157,7 +184,7 @@ public final class WheelFormats {
         List<Object> opts = new ArrayList<>();
         for (WheelOption o : w.options) {
             Map<String, Object> om = new LinkedHashMap<>();
-            om.put("id", o.id); om.put("text", o.text); om.put("trueWeight", o.trueWeight); om.put("fakeWeight", o.fakeWeight);
+            om.put("id", o.id); om.put("text", o.text); om.put("trueWeight", o.trueWeight); om.put("fakeWeight", o.fakeWeight);om.put("hidden",o.hidden);
             opts.add(om);
         }
         wm.put("options", opts);
@@ -224,8 +251,18 @@ public final class WheelFormats {
         return "classic";
     }
 
+    private static byte[] readAll(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int count;
+        while ((count = in.read(buffer)) != -1) out.write(buffer, 0, count);
+        return out.toByteArray();
+    }
+
     private static String str(Object v, String def) { return v == null ? def : String.valueOf(v); }
     private static String nullableStr(Object v) { return v == null ? null : String.valueOf(v); }
     private static double num(Object v, double def) { return v instanceof Number n ? n.doubleValue() : def; }
+    private static long longNum(Object v, long def) { return v instanceof Number n ? n.longValue() : def; }
+    private static double nonNegative(double v,double def){return Double.isFinite(v)&&v>=0?v:def;}
     private static double positive(double v, double def) { return v > 0 ? v : def; }
 }

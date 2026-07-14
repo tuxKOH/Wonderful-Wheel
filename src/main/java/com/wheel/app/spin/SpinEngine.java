@@ -14,12 +14,13 @@ public final class SpinEngine {
     private final Random random = new Random();
 
     public List<Segment> segments(Wheel wheel) {
-        double total = wheel.options.stream().mapToDouble(o -> Math.max(0, o.trueWeight)).sum();
+        double total = wheel.options.stream().filter(WheelOption::eligible).mapToDouble(WheelOption::displayWeight).sum();
         List<Segment> result = new ArrayList<>();
         if (total <= 0) return result;
         double angle = 0;
         for (WheelOption option : wheel.options) {
-            double sweep = 360.0 * Math.max(0, option.trueWeight) / total;
+            if(!option.eligible())continue;
+            double sweep = 360.0 * option.displayWeight() / total;
             result.add(new Segment(option, angle, sweep));
             angle += sweep;
         }
@@ -29,7 +30,7 @@ public final class SpinEngine {
     public SpinPlan createPlan(Wheel wheel) {
         List<Segment> segments = segments(wheel);
         if (segments.isEmpty()) throw new IllegalArgumentException("转盘没有有效选项");
-        double totalWeight = wheel.options.stream().mapToDouble(o -> Math.max(0, o.trueWeight)).sum();
+        double totalWeight = wheel.options.stream().filter(WheelOption::eligible).mapToDouble(o -> o.trueWeight).sum();
         double r = random.nextDouble() * totalWeight;
         double acc = 0;
         Segment selected = segments.get(segments.size() - 1);
@@ -51,10 +52,10 @@ public final class SpinEngine {
 
     public WheelOption optionAtPointer(Wheel wheel, double rotationDegrees) {
         double localAngle = normalize(270.0 - rotationDegrees);
-        for (Segment segment : segments(wheel)) {
+        List<Segment> visible=segments(wheel);for (Segment segment : visible) {
             if (localAngle >= segment.startAngle && localAngle < segment.startAngle + segment.sweepAngle) return segment.option;
         }
-        return wheel.options.isEmpty() ? null : wheel.options.get(wheel.options.size() - 1);
+        return visible.isEmpty()?null:visible.get(visible.size()-1).option();
     }
 
     private static double normalize(double a) {

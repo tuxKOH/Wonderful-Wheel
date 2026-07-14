@@ -1,13 +1,18 @@
 package com.wheel.app.android;
 
 import android.app.*;
+import android.Manifest;
 import android.os.*;
 import android.content.*;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.database.Cursor;
 import android.graphics.*;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.provider.OpenableColumns;
 import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.text.*;
 import android.view.*;
 import android.view.inputmethod.InputMethodManager;
@@ -21,10 +26,15 @@ import com.wheel.app.spin.SpinEngine;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.text.DateFormat;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MainActivity extends Activity implements TextToSpeech.OnInitListener {
-    private static final int REQ_IMPORT_PWH = 10, REQ_IMPORT_WWD = 11, REQ_EXPORT_PWH = 12, REQ_EXPORT_WWD = 13;
+    private static final int REQ_IMPORT_PWH = 10, REQ_IMPORT_WWD = 11, REQ_EXPORT_PWH = 12, REQ_EXPORT_WWD = 13, REQ_RENDER_STORAGE = 14;
     private static final int DARK_BG = 0xff090d14, DARK_PANEL = 0xff111827, DARK_CARD = 0xff172033, DARK_TEXT = 0xfff8fafc, DARK_SUB = 0xff98a2b3;
     private static final int ACCENT = 0xffea4b3b, BLUE = 0xff2563eb, DANGER = 0xffef4444;
 
@@ -37,11 +47,28 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
     private String listSearchText = "";
     private WheelView wheelView;
     private TextView badge, liveOption;
-    private enum Screen { MAIN, LIST, EDITOR }
+    private Button spinBtn, autoSpinBtn, renderBtn;
+    private Spinner renderTargetSpinner;
+    private final ExecutorService renderExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean renderCancelled = new AtomicBoolean();
+    private Future<?> renderFuture;
+    private AlertDialog renderDialog;
+    private WheelOption pendingRenderTarget;
+    private EditText autoSpinCount, editorNameInput, batchInput;
+    private long activeSpinId, autoGeneration;
+    private int autoTarget, autoCompleted;
+    private String autoWheelId;
+    private Runnable pendingAutoSpin;
+    private Runnable autoFeedbackTimeout;
+    private enum SpinMode { IDLE, MANUAL, AUTO_SPINNING, AUTO_WAITING }
+    private SpinMode spinMode = SpinMode.IDLE;
+    private enum Screen { MAIN, LIST, EDITOR, BATCH_EDITOR }
     private Screen currentScreen = Screen.MAIN;
     private Screen editorReturnScreen = Screen.MAIN;
     private Wheel editorWheel;
     private boolean editorCreating;
+    private String editorNameDraft = "", batchText = "";
+    private ArrayList<OptionDraft> editorDrafts;
     private TextToSpeech tts;
     private boolean ttsReady;
     private SpinSoundPlayer spinSound;
@@ -50,7 +77,8 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         super.onCreate(b);
         refreshMainPalette();
         tts = new TextToSpeech(this, this);
-        spinSound = new SpinSoundPlayer();
+        tts.setOnUtteranceProgressListener(new UtteranceProgressListener(){public void onStart(String id){}public void onDone(String id){runOnUiThread(()->finishAutoFeedback(id));}public void onError(String id){runOnUiThread(()->finishAutoFeedback(id));}});
+        spinSound = new SpinSoundPlayer(getApplicationContext());
         load(); seed();
         if (selectedWheel == null && !library.wheels.isEmpty()) selectedWheel = library.wheels.get(0);
         restoreNavigationState(b);
@@ -60,14 +88,23 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
                     this::handleSystemBack);
         }
         renderCurrentScreen();
+        consumeExternalImportIntent(getIntent());
+    }
+
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        consumeExternalImportIntent(intent);
     }
 
     public void onInit(int status) { ttsReady = status == TextToSpeech.SUCCESS; }
-    protected void onDestroy() { super.onDestroy(); if (tts != null) tts.shutdown(); if (spinSound != null) spinSound.release(); }
+    protected void onStop() { super.onStop(); stopAutoSpin(false); cancelCurrentSpin(false); if (spinSound != null) spinSound.cancelTicks(); if (tts != null) tts.stop(); }
+    protected void onDestroy() { cancelRender(); renderExecutor.shutdownNow(); stopAutoSpin(false); cancelCurrentSpin(false); if (tts != null) { tts.stop(); tts.shutdown(); } if (spinSound != null) spinSound.release(); super.onDestroy(); }
     public void onBackPressed() { handleSystemBack(); }
 
     private void handleSystemBack() {
         if (currentScreen == Screen.LIST) navigateTo(Screen.MAIN);
+        else if (currentScreen == Screen.BATCH_EDITOR) { captureBatch(); navigateTo(Screen.EDITOR); }
         else if (currentScreen == Screen.EDITOR) navigateTo(editorReturnScreen == Screen.LIST ? Screen.LIST : Screen.MAIN);
         else showExitConfirmation();
     }
@@ -78,7 +115,9 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
 
     private void navigateTo(Screen screen) { currentScreen = screen; renderCurrentScreen(); }
     private void renderCurrentScreen() {
+        if (currentScreen != Screen.MAIN) { stopAutoSpin(false); cancelCurrentSpin(false); }
         if (currentScreen == Screen.LIST) renderListScreen();
+        else if (currentScreen == Screen.BATCH_EDITOR && editorWheel != null) renderBatchEditorScreen();
         else if (currentScreen == Screen.EDITOR && editorWheel != null) renderEditorScreen();
         else { currentScreen = Screen.MAIN; buildMainUi(); select(selectedWheel); }
     }
@@ -92,10 +131,15 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         try { editorReturnScreen = Screen.valueOf(state.getString("editorReturnScreen", Screen.MAIN.name())); } catch (Exception ignored) { editorReturnScreen = Screen.MAIN; }
         editorCreating = state.getBoolean("editorCreating", false);
         editorWheel = editorCreating ? applyAppDefaults(new Wheel()) : wheelById(state.getString("editorWheelId"), null);
-        if (currentScreen == Screen.EDITOR && editorWheel == null) currentScreen = Screen.MAIN;
+        editorNameDraft = state.getString("editorNameDraft", editorWheel == null ? "" : editorWheel.name);
+        batchText = state.getString("batchText", "");
+        ArrayList<String> values = state.getStringArrayList("editorDrafts");
+        if (values != null) { editorDrafts = new ArrayList<>(); for (int i=0;i+4<values.size();i+=5) editorDrafts.add(new OptionDraft(values.get(i),values.get(i+1),values.get(i+2),values.get(i+3),Boolean.parseBoolean(values.get(i+4)))); }
+        if ((currentScreen == Screen.EDITOR || currentScreen == Screen.BATCH_EDITOR) && editorWheel == null) currentScreen = Screen.MAIN;
     }
 
     protected void onSaveInstanceState(Bundle out) {
+        captureEditor(); captureBatch();
         super.onSaveInstanceState(out);
         out.putString("currentScreen", currentScreen.name());
         out.putString("editorReturnScreen", editorReturnScreen.name());
@@ -104,6 +148,13 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         out.putString("listSearchText", listSearchText);
         out.putBoolean("editorCreating", editorCreating);
         out.putString("editorWheelId", editorWheel == null ? null : editorWheel.id);
+        out.putString("editorNameDraft", editorNameDraft);
+        out.putString("batchText", batchText);
+        if (editorDrafts != null) {
+            ArrayList<String> values = new ArrayList<>();
+            for (OptionDraft d : editorDrafts) { values.add(d.id); values.add(d.textValue); values.add(d.trueValue); values.add(d.fakeValue);values.add(String.valueOf(d.hiddenValue)); }
+            out.putStringArrayList("editorDrafts", values);
+        }
     }
 
     private Wheel wheelById(String id, Wheel fallback) {
@@ -131,6 +182,8 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
     }
 
     private void buildMainUi() {
+        stopAutoSpin(false);
+        cancelCurrentSpin(false);
         refreshMainPalette();
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -143,7 +196,7 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         topBar.addView(iconPlain("⚙", "设置", v -> showSettingsSheet(), darkMain ? 0xffaab3c2 : 0xff555555, 24));
         Space topSp = new Space(this);
         topBar.addView(topSp, new LinearLayout.LayoutParams(0, 1, 1));
-        topBar.addView(iconPlain("⋮", "列表", v -> navigateTo(Screen.LIST), darkMain ? 0xfff8fafc : 0xff333333, 24));
+        topBar.addView(iconPlain("⋮", "更多操作", this::showOverflowMenu, darkMain ? 0xfff8fafc : 0xff333333, 24));
 
         // Title badge: [list icon button] + wheel name pill
         LinearLayout titleRow = new LinearLayout(this);
@@ -188,25 +241,27 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         wheelView = new WheelView(this);
         wheelWrap.addView(wheelView, new FrameLayout.LayoutParams(-1, -1));
 
-        // Bottom bar: hamburger circle + "点击旋转" + pencil circle
-        LinearLayout bottom = new LinearLayout(this);
-        bottom.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, dp(64));
-        blp.setMargins(0, dp(16), 0, 0);
-        root.addView(bottom, blp);
+        // Bottom controls: manual, automatic, then offline-render row.
+        LinearLayout controls = new LinearLayout(this); controls.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams controlsLp = new LinearLayout.LayoutParams(-1, dp(172)); controlsLp.setMargins(0, dp(12), 0, 0); root.addView(controls, controlsLp);
+        LinearLayout bottom = new LinearLayout(this); bottom.setGravity(Gravity.CENTER_VERTICAL); controls.addView(bottom, new LinearLayout.LayoutParams(-1, dp(56)));
         bottom.addView(circleBtn("≡", v -> showSettingsSheet(), darkMain));
-        Button spinBtn = new Button(this);
-        spinBtn.setText("点击旋转");
-        spinBtn.setTextSize(16);
-        spinBtn.setTypeface(Typeface.DEFAULT);
-        spinBtn.setAllCaps(false);
-        spinBtn.setTextColor(ACCENT);
-        spinBtn.setBackground(round(darkMain ? 0xff1f2937 : 0xffffffff, dp(24), ACCENT, 2));
-        spinBtn.setOnClickListener(v -> spin());
-        LinearLayout.LayoutParams spinLp = new LinearLayout.LayoutParams(0, dp(48), 1);
-        spinLp.setMargins(dp(16), 0, dp(16), 0);
-        bottom.addView(spinBtn, spinLp);
+        spinBtn = new Button(this); spinBtn.setTextSize(16); spinBtn.setTypeface(Typeface.DEFAULT); spinBtn.setAllCaps(false);
+        spinBtn.setOnClickListener(v -> { if (spinMode == SpinMode.AUTO_SPINNING || spinMode == SpinMode.AUTO_WAITING) stopAutoSpin(true); else if (wheelView != null && wheelView.spinning) cancelCurrentSpin(true); else spin(); });
+        LinearLayout.LayoutParams spinLp = new LinearLayout.LayoutParams(0, dp(48), 1); spinLp.setMargins(dp(16), 0, dp(16), 0); bottom.addView(spinBtn, spinLp);
         bottom.addView(circleBtn("✎", v -> openEditor(selectedWheel, Screen.MAIN), darkMain));
+        LinearLayout autoRow = row(Gravity.CENTER_VERTICAL); controls.addView(autoRow, new LinearLayout.LayoutParams(-1, dp(56)));
+        autoSpinCount = input("次数（留空持续）", "", darkMain); autoSpinCount.setSingleLine(true); autoSpinCount.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        autoRow.addView(autoSpinCount, new LinearLayout.LayoutParams(0, dp(46), 1));
+        autoSpinBtn = actionButton("自动转", false, v -> { if (spinMode == SpinMode.AUTO_SPINNING || spinMode == SpinMode.AUTO_WAITING) stopAutoSpin(true); else startAutoSpin(); });
+        LinearLayout.LayoutParams autoLp = new LinearLayout.LayoutParams(dp(126), dp(46)); autoLp.setMargins(dp(10),0,0,0); autoRow.addView(autoSpinBtn, autoLp);
+        LinearLayout renderRow = row(Gravity.CENTER_VERTICAL); controls.addView(renderRow, new LinearLayout.LayoutParams(-1, dp(56)));
+        renderTargetSpinner = new Spinner(this);
+        renderRow.addView(renderTargetSpinner, new LinearLayout.LayoutParams(0, dp(46), 1));
+        renderBtn = actionButton("渲染视频", false, v -> requestRender());
+        LinearLayout.LayoutParams renderLp = new LinearLayout.LayoutParams(dp(126), dp(46)); renderLp.setMargins(dp(10),0,0,0); renderRow.addView(renderBtn, renderLp);
+        updateRenderChoices();
+        updateSpinControls();
         setContentView(root);
     }
 
@@ -259,8 +314,76 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
 
     private void duplicateWheel(Wheel src) {
         Wheel copy = new Wheel(); copy.name = library.uniqueWheelName(src.name + " 副本"); copy.groupId = src.groupId; copy.settings.rotationDurationMs = src.settings.rotationDurationMs; copy.settings.colorScheme = src.settings.colorScheme; copy.settings.fontSize = src.settings.fontSize; copy.settings.tickSoundEnabled = src.settings.tickSoundEnabled; copy.settings.selectedSoundEnabled = src.settings.selectedSoundEnabled; copy.settings.ttsEnabled = src.settings.ttsEnabled; copy.settings.ttsLanguageTag = src.settings.ttsLanguageTag;
-        for (WheelOption o : src.options) copy.options.add(new WheelOption(o.text, o.trueWeight, o.fakeWeight));
+        for (WheelOption o : src.options) {WheelOption copyOption=new WheelOption(o.text,o.trueWeight,o.fakeWeight);copyOption.hidden=o.hidden;copy.options.add(copyOption);}
         library.wheels.add(copy); save(); toast("已复制");
+    }
+
+    private void showOverflowMenu(View anchor) {
+        PopupMenu menu = new PopupMenu(this, anchor);
+        menu.getMenu().add(0, 1, 0, "新建");
+        menu.getMenu().add(0, 2, 1, "列表");
+        menu.getMenu().add(0, 3, 2, "复位");
+        menu.getMenu().add(0, 4, 3, "历史记录");
+        menu.setOnMenuItemClickListener(item -> {
+            if (item.getItemId() == 1) openEditor(null, Screen.MAIN);
+            else if (item.getItemId() == 2) navigateTo(Screen.LIST);
+            else if (item.getItemId() == 3) resetRuntimeState();
+            else if (item.getItemId() == 4) showCurrentWheelHistory();
+            return true;
+        });
+        menu.show();
+    }
+
+    private void resetRuntimeState() {
+        stopAutoSpin(false);
+        cancelCurrentSpin(false);
+        activeSpinId = 0;
+        if (spinSound != null) spinSound.cancelTicks();
+        if (tts != null) tts.stop();
+        updateSpinControls();
+        if (liveOption != null) liveOption.setText(selectedWheel == null ? "请先新建转盘" : "准备好了");
+        if (wheelView != null) wheelView.invalidate();
+    }
+
+    private void showCurrentWheelHistory() {
+        if (selectedWheel == null) { toast("请先新建转盘"); return; }
+        Wheel wheel = selectedWheel;
+        ArrayList<SpinHistoryEntry> entries = new ArrayList<>();
+        for (SpinHistoryEntry entry : library.history) if (Objects.equals(wheel.id, entry.wheelId)) entries.add(entry);
+        Collections.sort(entries, (a, b) -> Long.compare(b.createdAt, a.createdAt));
+        LinearLayout content = new LinearLayout(this); content.setOrientation(LinearLayout.VERTICAL); content.setPadding(dp(20), dp(8), dp(20), dp(8));
+        if (entries.isEmpty()) content.addView(emptyText("暂无自然完成的抽取记录", darkMain));
+        else {
+            DateFormat format = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT);
+            for (SpinHistoryEntry entry : entries) {
+                String when = entry.createdAt > 0 ? format.format(new Date(entry.createdAt)) : "时间未知";
+                LinearLayout historyRow=row(Gravity.CENTER_VERTICAL);TextView row = label(entry.optionText + "\n" + entry.wheelName + " · " + when, 15, text, false);historyRow.addView(row,new LinearLayout.LayoutParams(0,-2,1));WheelOption target=historyTarget(wheel,entry);TextView render=smallDarkButton("渲染",v->{historyDialogSafeStart(wheel,target);});render.setEnabled(target!=null);render.setAlpha(target==null?.4f:1f);historyRow.addView(render,new LinearLayout.LayoutParams(dp(72),dp(42)));
+                historyRow.setPadding(dp(12), dp(10), dp(12), dp(10));
+                historyRow.setBackground(round(panel, dp(12), stroke, 1));
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2); lp.setMargins(0, 0, 0, dp(8)); content.addView(historyRow, lp);
+            }
+        }
+        ScrollView scroll = new ScrollView(this); scroll.addView(content);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("历史记录 · " + wheel.name).setView(scroll).setNegativeButton("关闭", null).setPositiveButton("清空", null).create();
+        dialog.setOnShowListener(ignored -> {
+            Button clear = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+            clear.setEnabled(!entries.isEmpty());
+            clear.setOnClickListener(v -> confirmClearHistory(wheel, dialog));
+        });
+        dialog.show();
+    }
+
+    private WheelOption historyTarget(Wheel wheel,SpinHistoryEntry entry){if(entry.optionId!=null){for(WheelOption o:wheel.options)if(entry.optionId.equals(o.id))return o;return null;}WheelOption match=null;for(WheelOption o:wheel.options)if(Objects.equals(entry.optionText,o.text)){if(match!=null)return null;match=o;}return match;}
+    private void historyDialogSafeStart(Wheel wheel,WheelOption target){if(target==null)return;Wheel snapshot=copyWheel(wheel);WheelOption copied=null;for(WheelOption o:snapshot.options)if(o.id.equals(target.id)){copied=o;break;}if(copied==null)return;copied.hidden=false;if(copied.trueWeight==0)copied.trueWeight=1;if(copied.fakeWeight!=null&&copied.fakeWeight==0)copied.fakeWeight=1.0;startRenderSnapshot(snapshot,copied,wheelView==null?0:wheelView.rotation);}
+
+    private void confirmClearHistory(Wheel wheel, AlertDialog historyDialog) {
+        new AlertDialog.Builder(this).setTitle("清空历史记录？")
+                .setMessage("只会清空当前转盘「" + wheel.name + "」的历史记录，其他转盘和转盘数据不会受影响。")
+                .setPositiveButton("清空", (d, which) -> {
+                    int before = library.history.size();
+                    for (Iterator<SpinHistoryEntry> it = library.history.iterator(); it.hasNext();) if (Objects.equals(wheel.id, it.next().wheelId)) it.remove();
+                    save(); historyDialog.dismiss(); toast("已清空 " + (before - library.history.size()) + " 条记录");
+                }).setNegativeButton("取消", null).show();
     }
 
     private void showSettingsSheet() {
@@ -273,7 +396,7 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
             else if (which == 4) open(REQ_IMPORT_PWH, "*/*");
             else if (which == 5) open(REQ_IMPORT_WWD, "*/*");
             else if (which == 6) create(REQ_EXPORT_PWH, safeName(selectedWheel == null ? "export" : selectedWheel.name) + ".pwh");
-            else if (which == 7) create(REQ_EXPORT_WWD, "export.wwd.json");
+            else if (which == 7) create(REQ_EXPORT_WWD, "export.wwd");
             else if (which == 8) deleteCurrent();
         }).show();
     }
@@ -284,12 +407,13 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         if (wheelView != null) wheelView.setWheel(w);
         if (badge != null) badge.setText(w == null ? "今天转什么？" : w.name);
         if (liveOption != null) liveOption.setText(w == null ? "请先新建转盘" : "准备好了");
+        updateRenderChoices();
     }
 
     private void openEditor(Wheel existing, Screen returnScreen) {
         editorReturnScreen = returnScreen == Screen.LIST ? Screen.LIST : Screen.MAIN;
-        editorCreating = existing == null;
-        editorWheel = existing == null ? applyAppDefaults(new Wheel()) : existing;
+        editorCreating = existing == null; editorWheel = existing == null ? applyAppDefaults(new Wheel()) : existing;
+        editorNameDraft=editorWheel.name; editorDrafts=new ArrayList<>(); for(WheelOption o:editorWheel.options)editorDrafts.add(new OptionDraft(o)); if(editorCreating&&editorDrafts.isEmpty()){editorDrafts.add(new OptionDraft("选项 1"));editorDrafts.add(new OptionDraft("选项 2"));} batchText="";
         navigateTo(Screen.EDITOR);
     }
 
@@ -305,25 +429,46 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         TextView saveButton = (TextView) bar.getChildAt(2);
 
         ScrollView scroll = new ScrollView(this); LinearLayout p = new LinearLayout(this); p.setOrientation(LinearLayout.VERTICAL); scroll.addView(p); root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        EditText name = input("问题 / 转盘标题", w.name, true); p.addView(name, new LinearLayout.LayoutParams(-1, dp(56)));
+        EditText name = input("问题 / 转盘标题", editorNameDraft, true); editorNameInput=name; p.addView(name, new LinearLayout.LayoutParams(-1, dp(56)));
         TextView optionTitle = label("选项", 13, DARK_SUB, true); optionTitle.setPadding(0, dp(16), 0, dp(8)); p.addView(optionTitle);
         LinearLayout optionRows = new LinearLayout(this); optionRows.setOrientation(LinearLayout.VERTICAL); p.addView(optionRows);
-        ArrayList<OptionDraft> drafts = new ArrayList<>(); for (WheelOption o : w.options) drafts.add(new OptionDraft(o)); if (existing == null && drafts.isEmpty()) { drafts.add(new OptionDraft("选项 1")); drafts.add(new OptionDraft("选项 2")); }
+        ArrayList<OptionDraft> drafts = editorDrafts == null ? new ArrayList<>() : editorDrafts; editorDrafts=drafts;
         Runnable[] render = new Runnable[1];
         render[0] = () -> renderOptionRows(optionRows, drafts, render[0], true); render[0].run();
         LinearLayout editorActions = row(Gravity.CENTER_VERTICAL); p.addView(editorActions, new LinearLayout.LayoutParams(-1, dp(54)));
-        editorActions.addView(actionButton("添加选项", true, v -> { captureAll(drafts); drafts.add(new OptionDraft()); render[0].run(); }), new LinearLayout.LayoutParams(0, dp(48), 1));
-        LinearLayout.LayoutParams advLp = new LinearLayout.LayoutParams(0, dp(48), 1); advLp.setMargins(dp(10),0,0,0); editorActions.addView(actionButton("高级设置", false, v -> showAdvancedDialog(w, drafts)), advLp);
+        editorActions.addView(actionButton("添加选项", true, v -> { captureEditor(); drafts.add(new OptionDraft()); render[0].run(); }), new LinearLayout.LayoutParams(0, dp(48), 1));
+        LinearLayout.LayoutParams batchLp=new LinearLayout.LayoutParams(0,dp(48),1);batchLp.setMargins(dp(8),0,0,0);editorActions.addView(actionButton("批量创建",false,v->{captureEditor();navigateTo(Screen.BATCH_EDITOR);}),batchLp);
+        LinearLayout.LayoutParams advLp = new LinearLayout.LayoutParams(0, dp(48), 1); advLp.setMargins(dp(8),0,0,0); editorActions.addView(actionButton("高级设置", false, v -> showAdvancedDialog(w, drafts)), advLp);
         TextView footer = label("预览：权重 / 分组 / 时长 / 配色 / 字体 / 声音 / TTS 可在高级设置中调整", 13, DARK_SUB, false); footer.setGravity(Gravity.CENTER); footer.setPadding(0, dp(18), 0, dp(22)); p.addView(footer);
         saveButton.setOnClickListener(v -> {
             String wheelName = name.getText().toString().trim(); if (wheelName.isEmpty()) { toast("问题不能为空"); return; }
             ArrayList<WheelOption> parsed = new ArrayList<>(); for (int i = 0; i < drafts.size(); i++) { OptionDraft draft = drafts.get(i); String error = draft.validate(); if (error != null) { toast("第 " + (i + 1) + " 行：" + error); return; } parsed.add(draft.toOption()); }
             if (parsed.isEmpty()) { toast("至少需要一个选项"); return; }
             w.name = wheelName; w.options = parsed; w.updatedAt = System.currentTimeMillis(); if (editorCreating) library.wheels.add(w); save(); select(w);
-            editorCreating = false; editorWheel = null; navigateTo(editorReturnScreen);
+            editorCreating = false; editorWheel = null; editorDrafts=null; editorNameInput=null; navigateTo(editorReturnScreen);
         });
         setContentView(root);
     }
+
+    private void renderBatchEditorScreen(){
+        useDarkBars(); LinearLayout root=darkScreen(); LinearLayout bar=row(Gravity.CENTER_VERTICAL);root.addView(bar,new LinearLayout.LayoutParams(-1,dp(58)));
+        bar.addView(iconButton("‹","返回",v->{captureBatch();navigateTo(Screen.EDITOR);},true),new LinearLayout.LayoutParams(dp(48),dp(48)));
+        bar.addView(label("批量创建",22,DARK_TEXT,true),new LinearLayout.LayoutParams(0,-1,1));
+        TextView add=iconButton("✓","添加",v->{},true);bar.addView(add,new LinearLayout.LayoutParams(dp(48),dp(48)));
+        TextView help=label("每行一个选项名；权重稍后在编辑页设置",14,DARK_SUB,false);help.setPadding(0,dp(8),0,dp(8));root.addView(help);
+        batchInput=input("选项 A\n选项 B\n选项 C",batchText,true);batchInput.setGravity(Gravity.TOP);batchInput.setPadding(dp(14),dp(14),dp(14),dp(14));root.addView(batchInput,new LinearLayout.LayoutParams(-1,0,1));
+        add.setOnClickListener(v->{captureBatch();BatchResult result=appendBatchOptions(editorDrafts,batchText);if(result.added==0){toast("没有可添加的新选项");return;}batchText="";batchInput=null;toast("已添加 "+result.added+" 项；跳过空行 "+result.blank+"、重复 "+result.duplicate);navigateTo(Screen.EDITOR);});
+        setContentView(root);batchInput.requestFocus();batchInput.post(()->((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).showSoftInput(batchInput,InputMethodManager.SHOW_IMPLICIT));
+    }
+
+    private void captureEditor(){ if(editorNameInput!=null)editorNameDraft=editorNameInput.getText().toString();if(editorDrafts!=null)captureAll(editorDrafts); }
+    private void captureBatch(){ if(batchInput!=null)batchText=batchInput.getText().toString(); }
+    private BatchResult appendBatchOptions(ArrayList<OptionDraft> drafts,String raw){
+        HashSet<String> existing=new HashSet<>();for(OptionDraft d:drafts)existing.add(d.textValue.trim());HashSet<String> batch=new HashSet<>();int added=0,blank=0,duplicate=0;
+        for(String line:(raw==null?"":raw).split("\\R",-1)){String name=line.trim();if(name.isEmpty()){blank++;continue;}if(existing.contains(name)||!batch.add(name)){duplicate++;continue;}drafts.add(new OptionDraft(name));added++;}
+        return new BatchResult(added,blank,duplicate);
+    }
+    private record BatchResult(int added,int blank,int duplicate){}
 
     private void showAdvancedDialog(Wheel w, ArrayList<OptionDraft> drafts) {
         refreshMainPalette();
@@ -369,7 +514,8 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
             box.setOrientation(LinearLayout.HORIZONTAL);
             box.setGravity(Gravity.CENTER_VERTICAL);
             box.setPadding(dp(6), dp(4), dp(6), dp(4));
-            box.setBackground(round(dark ? DARK_CARD : 0xffffffff, dp(14), dark ? 0xff263244 : 0xffe5e0d8, 1));
+            box.setBackground(round(dark ? (d.hiddenValue?0xff20242c:DARK_CARD) : (d.hiddenValue?0xffeeeeee:0xffffffff), dp(14), dark ? 0xff263244 : 0xffe5e0d8, 1));
+            box.setAlpha(d.hiddenValue?.58f:1f);
 
             // Drag handle (⠿) — long-press + drag to reorder (no system shadow)
             TextView handle = new TextView(this);
@@ -476,6 +622,8 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
             fw.setMargins(0, 0, dp(3), 0);
             box.addView(d.fakeWeight, fw);
 
+            TextView hide=new TextView(this);hide.setText(d.hiddenValue?"显示":"隐藏");hide.setTextSize(12);hide.setTextColor(dark?DARK_TEXT:text);hide.setGravity(Gravity.CENTER);hide.setContentDescription(d.hiddenValue?"显示选项":"隐藏选项");hide.setOnClickListener(v->{captureAll(drafts);if(d.hiddenValue){Double tv=d.parse(d.trueValue,1.0),fv=d.fakeValue.trim().isEmpty()?tv:d.parse(d.fakeValue,null);if(tv==null||fv==null||tv<=0||fv<=0){toast("请先把真权重和显示权重改为大于 0");return;}d.hiddenValue=false;}else d.hiddenValue=true;render.run();});box.addView(hide,new LinearLayout.LayoutParams(dp(48),dp(38)));
+
             // Delete × button (red)
             TextView del = new TextView(this);
             del.setText("✕"); del.setTextSize(15);
@@ -504,28 +652,211 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
         dialog.setOnShowListener(x -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v->{ String value=name.getText().toString().trim(); if(value.isEmpty()){toast("分组名不能为空");return;} String parentId=choices.get(parent.getSelectedItemPosition()).id; for(WheelGroup existing:library.groups)if(Objects.equals(existing.parentId,parentId)&&existing.name.equalsIgnoreCase(value)){toast("同一上级分组下不能有重名分组");return;} WheelGroup g=new WheelGroup(); g.name=value; g.parentId=parentId; library.groups.add(g); save(); select(selectedWheel); dialog.dismiss(); if(created!=null)created.accept(g.id); })); dialog.show();
     }
 
-    private void deleteCurrent() { if (selectedWheel == null) return; new AlertDialog.Builder(this).setTitle("删除转盘？").setMessage(selectedWheel.name).setPositiveButton("删除", (d,w) -> { library.wheels.remove(selectedWheel); selectedWheel = library.wheels.isEmpty() ? null : library.wheels.get(0); save(); select(selectedWheel); }).setNegativeButton("取消", null).show(); }
+    private void deleteCurrent() { if (selectedWheel == null) return; new AlertDialog.Builder(this).setTitle("删除转盘？").setMessage(selectedWheel.name).setPositiveButton("删除", (d,w) -> { stopAutoSpin(false); cancelCurrentSpin(false); library.wheels.remove(selectedWheel); selectedWheel = library.wheels.isEmpty() ? null : library.wheels.get(0); save(); select(selectedWheel); }).setNegativeButton("取消", null).show(); }
 
     private void spin() {
+        spinMode = SpinMode.MANUAL;
+        startSingleSpin(false, autoGeneration);
+    }
+
+    private void startAutoSpin() {
         if (selectedWheel == null || selectedWheel.options.isEmpty()) { toast("请先新建转盘"); return; }
-        if (wheelView.spinning) return;
-        SpinEngine.SpinPlan plan = engine.createPlan(selectedWheel, wheelView.rotation);
-        liveOption.setText("旋转中…");
-        wheelView.spin(plan, o -> { liveOption.setText(o.text); if(selectedWheel.settings.tickSoundEnabled) spinSound.tick(); }, () -> { liveOption.setText(plan.target().text); if(selectedWheel.settings.selectedSoundEnabled) spinSound.selected(); speakResult(plan.target().text); });
+        String raw = autoSpinCount == null ? "" : autoSpinCount.getText().toString().trim();
+        int count = -1;
+        if (!raw.isEmpty()) { try { count=Integer.parseInt(raw); } catch(Exception e){ toast("次数必须是 1–9999 的整数"); return; } if(count<1||count>9999){toast("次数必须是 1–9999 的整数");return;} }
+        autoGeneration++; autoTarget=count; autoCompleted=0; autoWheelId=selectedWheel.id; spinMode=SpinMode.AUTO_SPINNING; updateSpinControls(); startSingleSpin(true,autoGeneration);
     }
 
-    private void speakResult(String value) {
-        if (!selectedWheel.settings.ttsEnabled || !ttsReady) return;
-        String tag=selectedWheel.settings.ttsLanguageTag; if(tag==null||tag.isEmpty()) tag=library.settings.defaultTtsLanguageTag; Locale requested=tag==null||tag.isEmpty()?Locale.getDefault():Locale.forLanguageTag(tag);
-        int support=tts.setLanguage(requested); if(support==TextToSpeech.LANG_MISSING_DATA||support==TextToSpeech.LANG_NOT_SUPPORTED){ Locale fallback=Locale.getDefault(); support=tts.setLanguage(fallback); }
-        if(support==TextToSpeech.LANG_MISSING_DATA||support==TextToSpeech.LANG_NOT_SUPPORTED){ toast("TTS 不支持所选语言"); return; }
-        tts.speak(value,TextToSpeech.QUEUE_FLUSH,null,"wheel-result");
+    private void startSingleSpin(boolean automatic, long generation) {
+        if (selectedWheel == null || selectedWheel.options.isEmpty() || wheelView == null || wheelView.spinning) { if(automatic)stopAutoSpin(false); else {spinMode=SpinMode.IDLE;updateSpinControls();} return; }
+        if (automatic && (generation!=autoGeneration || currentScreen!=Screen.MAIN || !Objects.equals(autoWheelId,selectedWheel.id))) { stopAutoSpin(false); return; }
+        Wheel spinningWheel = selectedWheel;
+        SpinEngine.SpinPlan plan;
+        try { plan=engine.createPlan(spinningWheel,wheelView.rotation); } catch(Exception e){ toast(e.getMessage()); if(automatic)stopAutoSpin(false); else{spinMode=SpinMode.IDLE;updateSpinControls();} return; }
+        if (tts != null) tts.stop(); spinSound.cancelTicks(); liveOption.setText("旋转中…"); updateSpinControls();
+        activeSpinId = wheelView.spin(plan, o -> { liveOption.setText(o.text); if(spinningWheel.settings.tickSoundEnabled)spinSound.tick(); }, () -> {
+            if (automatic && generation != autoGeneration) return;
+            activeSpinId=0; SpinHistoryEntry entry=new SpinHistoryEntry(); entry.wheelId=spinningWheel.id;entry.wheelName=spinningWheel.name;entry.optionId=plan.target().id;entry.optionText=plan.target().text;library.history.add(entry);save();
+            liveOption.setText(plan.target().text);
+            if(spinningWheel.settings.selectedSoundEnabled)spinSound.selected();
+            if (!automatic) { speakResult(spinningWheel,plan.target().text,null); spinMode=SpinMode.IDLE; updateSpinControls(); return; }
+            autoCompleted++; spinMode=SpinMode.AUTO_WAITING; updateSpinControls(); final String feedbackId="auto-result-"+generation+"-"+autoCompleted;
+            Runnable speak=()->{if(generation!=autoGeneration)return;boolean speaking=speakResult(spinningWheel,plan.target().text,feedbackId);if(!speaking)finishAutoFeedback(feedbackId);else{autoFeedbackTimeout=()->finishAutoFeedback(feedbackId);wheelView.postDelayed(autoFeedbackTimeout,30_000);}};
+            wheelView.postDelayed(speak,spinningWheel.settings.selectedSoundEnabled?170:0);
+        });
     }
 
-    protected void onActivityResult(int req, int res, Intent data) { super.onActivityResult(req,res,data); if(res!=RESULT_OK||data==null||data.getData()==null)return; Uri u=data.getData(); try { if(req==REQ_IMPORT_PWH){ for(Wheel w: WheelFormats.importPwh(read(u), selectedGroupId)){applyAppDefaults(w); w.name=library.uniqueWheelName(w.name); library.wheels.add(w); selectedWheel=w;} save(); buildMainUi(); select(selectedWheel); toast("PWH 导入完成"); } else if(req==REQ_IMPORT_WWD){ WheelLibrary l=WheelFormats.importWwd(read(u)); library.settings=l.settings; library.groups.addAll(l.groups); library.wheels.addAll(l.wheels); if(!l.wheels.isEmpty()) selectedWheel=l.wheels.get(0); save(); buildMainUi(); select(selectedWheel); toast("WWD 导入完成"); } else if(req==REQ_EXPORT_PWH){ write(u, WheelFormats.exportPwh(selectedWheel==null?library.wheels:java.util.List.of(selectedWheel))); toast("PWH 导出完成"); } else if(req==REQ_EXPORT_WWD){ write(u, WheelFormats.exportWwd(library,false)); toast("WWD 导出完成"); } } catch(Exception e){ toast(e.getMessage()); } }
+    private void finishAutoFeedback(String id){
+        if(!id.startsWith("auto-result-"+autoGeneration+"-")||spinMode!=SpinMode.AUTO_WAITING)return;
+        if(autoFeedbackTimeout!=null&&wheelView!=null)wheelView.removeCallbacks(autoFeedbackTimeout);autoFeedbackTimeout=null;
+        if(autoTarget>0&&autoCompleted>=autoTarget){spinMode=SpinMode.IDLE;autoWheelId=null;updateSpinControls();return;}
+        long run=autoGeneration;pendingAutoSpin=()->{pendingAutoSpin=null;if(run!=autoGeneration||spinMode!=SpinMode.AUTO_WAITING)return;spinMode=SpinMode.AUTO_SPINNING;updateSpinControls();startSingleSpin(true,run);};wheelView.post(pendingAutoSpin);
+    }
+
+    private void updateSpinControls() {
+        boolean auto = spinMode==SpinMode.AUTO_SPINNING||spinMode==SpinMode.AUTO_WAITING;
+        boolean manual = spinMode==SpinMode.MANUAL;
+        if(spinBtn!=null){spinBtn.setText(auto?"停止自动转":manual?"终止转盘":"点击旋转");spinBtn.setTextColor((auto||manual)?Color.WHITE:ACCENT);spinBtn.setBackground(round((auto||manual)?DANGER:(darkMain?0xff1f2937:0xffffffff),dp(24),(auto||manual)?0:ACCENT,(auto||manual)?0:2));}
+        if(autoSpinBtn!=null){autoSpinBtn.setText(auto?(autoTarget>0?"停止 "+autoCompleted+"/"+autoTarget:"停止自动"):"自动转");autoSpinBtn.setEnabled(!manual);}
+        if(autoSpinCount!=null)autoSpinCount.setEnabled(!auto&&!manual);
+        updateRenderChoices();
+    }
+
+    private void updateRenderChoices() {
+        if (renderTargetSpinner == null) return;
+        ArrayList<RenderChoice> choices = new ArrayList<>();
+        choices.add(new RenderChoice("当前指针（默认）", null));
+        if (selectedWheel != null) for (WheelOption option : selectedWheel.options) if(option.eligible())choices.add(new RenderChoice(option.text, option));
+        renderTargetSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, choices));
+        boolean valid = selectedWheel != null && !selectedWheel.options.isEmpty() && wheelView != null && engine.optionAtPointer(selectedWheel,wheelView.rotation)!=null && spinMode==SpinMode.IDLE;
+        renderTargetSpinner.setEnabled(valid && renderFuture == null);
+        if (renderBtn != null) { boolean enabled=valid&&renderFuture==null;renderBtn.setEnabled(enabled); renderBtn.setAlpha(enabled ? 1f : .45f); }
+    }
+
+    private void requestRender() {
+        if (selectedWheel == null || selectedWheel.options.isEmpty() || wheelView == null) { toast("没有可渲染的结果"); return; }
+        if (renderFuture != null) return;
+        @SuppressWarnings("unchecked") ArrayAdapter<RenderChoice> adapter=(ArrayAdapter<RenderChoice>)renderTargetSpinner.getAdapter();
+        RenderChoice choice=adapter.getItem(renderTargetSpinner.getSelectedItemPosition());
+        WheelOption target=choice==null?null:choice.option;
+        if(target==null)target=engine.optionAtPointer(selectedWheel,wheelView.rotation);
+        if(target==null){toast("没有可渲染的结果");return;}
+        pendingRenderTarget=target;
+        if(Build.VERSION.SDK_INT<29&&checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE},REQ_RENDER_STORAGE);return;}
+        startRender(target);
+    }
+
+    private void startRender(WheelOption target) {
+        Wheel wheel=copyWheel(selectedWheel); if(wheel==null||target==null)return;
+        WheelOption copiedTarget=null;for(WheelOption option:wheel.options)if(option.id.equals(target.id)){copiedTarget=option;break;}if(copiedTarget==null)return;startRenderSnapshot(wheel,copiedTarget,wheelView==null?0:wheelView.rotation);
+    }
+    private void startRenderSnapshot(Wheel wheel,WheelOption target,double rotation){
+        stopAutoSpin(false);cancelCurrentSpin(false);renderCancelled.set(false);
+        TextView message=label("准备渲染…",15,text,false);message.setPadding(dp(20),dp(20),dp(20),dp(20));
+        renderDialog=new AlertDialog.Builder(this).setTitle("离线渲染 MP4").setView(message).setNegativeButton("取消",(d,w)->cancelRender()).create();renderDialog.setCanceledOnTouchOutside(false);renderDialog.show();
+        boolean dark=darkMain;float fontScale=getResources().getConfiguration().fontScale;
+        final WheelOption renderTarget=target;
+        renderFuture=renderExecutor.submit(()->{try{OfflineMp4Renderer.Result result=new OfflineMp4Renderer(this,renderCancelled).render(wheel,library.settings,renderTarget,rotation,dark,fontScale,status->runOnUiThread(()->message.setText(status)));runOnUiThread(()->finishRender(result,null));}catch(Exception e){runOnUiThread(()->finishRender(null,e));}});
+        updateRenderChoices();
+    }
+
+    private Wheel copyWheel(Wheel source){if(source==null)return null;Wheel copy=new Wheel();copy.id=source.id;copy.name=source.name;copy.groupId=source.groupId;copy.settings.rotationDurationMs=source.settings.rotationDurationMs;copy.settings.colorScheme=source.settings.colorScheme;copy.settings.fontSize=source.settings.fontSize;copy.settings.tickSoundEnabled=source.settings.tickSoundEnabled;copy.settings.selectedSoundEnabled=source.settings.selectedSoundEnabled;copy.settings.ttsEnabled=source.settings.ttsEnabled;copy.settings.ttsLanguageTag=source.settings.ttsLanguageTag;for(WheelOption option:source.options){WheelOption o=new WheelOption(option.text,option.trueWeight,option.fakeWeight);o.id=option.id;o.hidden=option.hidden;copy.options.add(o);}return copy;}
+
+    private void finishRender(OfflineMp4Renderer.Result result,Exception error){renderFuture=null;if(renderDialog!=null){renderDialog.dismiss();renderDialog=null;}updateRenderChoices();if(isFinishing()||isDestroyed())return;if(error!=null){if(!(error instanceof InterruptedException))new AlertDialog.Builder(this).setTitle("渲染失败").setMessage(error.getMessage()==null?error.toString():error.getMessage()).setPositiveButton("确定",null).show();return;}toast("已保存到 Movies/wheel："+result.name);}
+    private void cancelRender(){renderCancelled.set(true);if(renderFuture!=null)renderFuture.cancel(true);renderFuture=null;if(renderDialog!=null){renderDialog.dismiss();renderDialog=null;}updateRenderChoices();}
+    public void onRequestPermissionsResult(int requestCode,String[] permissions,int[] grantResults){super.onRequestPermissionsResult(requestCode,permissions,grantResults);if(requestCode==REQ_RENDER_STORAGE){if(grantResults.length>0&&grantResults[0]==PackageManager.PERMISSION_GRANTED)startRender(pendingRenderTarget);else toast("需要存储权限才能保存到 Movies/wheel");pendingRenderTarget=null;}}
+    private record RenderChoice(String label,WheelOption option){public String toString(){return label;}}
+
+    private void stopAutoSpin(boolean userInitiated) {
+        boolean wasAuto=spinMode==SpinMode.AUTO_SPINNING||spinMode==SpinMode.AUTO_WAITING;
+        if(!wasAuto)return; autoGeneration++; if(pendingAutoSpin!=null&&wheelView!=null)wheelView.removeCallbacks(pendingAutoSpin);if(autoFeedbackTimeout!=null&&wheelView!=null)wheelView.removeCallbacks(autoFeedbackTimeout);pendingAutoSpin=null;autoFeedbackTimeout=null;spinMode=SpinMode.IDLE;autoWheelId=null;cancelCurrentSpin(false);if(spinSound!=null)spinSound.cancelTicks();if(tts!=null)tts.stop();if(userInitiated&&liveOption!=null)liveOption.setText("自动转已停止");updateSpinControls();
+    }
+
+    private boolean cancelCurrentSpin(boolean userInitiated) {
+        if (wheelView == null) return false;
+        long spinId = activeSpinId != 0 ? activeSpinId : wheelView.currentSpinId();
+        if (!wheelView.cancelSpin(spinId)) return false;
+        activeSpinId = 0;
+        if (spinSound != null) spinSound.cancelTicks();
+        if (tts != null) tts.stop();
+        if (userInitiated && liveOption != null) liveOption.setText("本次抽取已取消");
+        if(spinMode==SpinMode.MANUAL)spinMode=SpinMode.IDLE;
+        updateSpinControls();
+        return true;
+    }
+
+    private boolean speakResult(Wheel wheel, String value, String utteranceId) {
+        if (!wheel.settings.ttsEnabled || !ttsReady) return false;
+        Locale locale=TtsLanguageResolver.apply(wheel.settings.ttsLanguageTag,library.settings.defaultTtsLanguageTag,Locale.getDefault(),tts::setLanguage);
+        if(locale==null){ toast("TTS 不支持转盘、应用或系统语言"); return false; }
+        String id=utteranceId==null?"wheel-result":utteranceId;
+        int result=tts.speak(value,TextToSpeech.QUEUE_FLUSH,null,id);
+        return result==TextToSpeech.SUCCESS;
+    }
+
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req,res,data);
+        if(res!=RESULT_OK||data==null||data.getData()==null)return;
+        Uri u=data.getData();
+        try {
+            if(req==REQ_IMPORT_PWH) importPwhBytes(read(u));
+            else if(req==REQ_IMPORT_WWD){ WheelLibrary l=WheelFormats.importWwd(read(u)); mergeWwd(l); save(); buildMainUi(); select(selectedWheel); toast("WWD 导入完成"); }
+            else if(req==REQ_EXPORT_PWH){ write(u, WheelFormats.exportPwh(selectedWheel==null?library.wheels:java.util.List.of(selectedWheel))); toast("PWH 导出完成"); }
+            else if(req==REQ_EXPORT_WWD){ write(u, WheelFormats.exportWwd(library,false)); toast("WWD 导出完成"); }
+        } catch(Exception e){ toast(e.getMessage()); }
+    }
+
+    private void importPwhBytes(byte[] bytes) throws IOException {
+        List<Wheel> imported = WheelFormats.importPwh(bytes, selectedGroupId);
+        if (imported.isEmpty()) throw new IOException("PWH 中没有有效转盘");
+        for(Wheel w: imported){ applyAppDefaults(w); w.name=library.uniqueWheelName(w.name); library.wheels.add(w); selectedWheel=w; }
+        save();
+        if (currentScreen == Screen.MAIN) { buildMainUi(); select(selectedWheel); }
+        else if (currentScreen == Screen.LIST) renderListScreen();
+        toast("PWH 导入完成");
+    }
+
+    private void mergeWwd(WheelLibrary imported) {
+        HashSet<String> usedGroupIds = new HashSet<>();
+        for (WheelGroup group : library.groups) usedGroupIds.add(group.id);
+        HashMap<String, String> groupIds = new HashMap<>();
+        for (WheelGroup group : imported.groups) {
+            String oldId = group.id;
+            if (usedGroupIds.contains(group.id)) group.id = Models.newId();
+            usedGroupIds.add(group.id); groupIds.putIfAbsent(oldId, group.id);
+        }
+        for (WheelGroup group : imported.groups) if (groupIds.containsKey(group.parentId)) group.parentId = groupIds.get(group.parentId);
+        for (Wheel wheel : imported.wheels) if (groupIds.containsKey(wheel.groupId)) wheel.groupId = groupIds.get(wheel.groupId);
+        HashSet<String> usedWheelIds = new HashSet<>();
+        for (Wheel wheel : library.wheels) usedWheelIds.add(wheel.id);
+        HashMap<String, String> wheelIds = new HashMap<>();
+        for (Wheel wheel : imported.wheels) {
+            String oldId = wheel.id;
+            if (usedWheelIds.contains(wheel.id)) wheel.id = Models.newId();
+            usedWheelIds.add(wheel.id); wheelIds.putIfAbsent(oldId, wheel.id);
+        }
+        for (SpinHistoryEntry entry : imported.history) if (wheelIds.containsKey(entry.wheelId)) entry.wheelId = wheelIds.get(entry.wheelId);
+        library.settings=imported.settings; library.groups.addAll(imported.groups); library.wheels.addAll(imported.wheels); library.history.addAll(imported.history);
+        if(!imported.wheels.isEmpty()) selectedWheel=imported.wheels.get(0);
+    }
+
+    private void consumeExternalImportIntent(Intent intent) {
+        if (intent == null) return;
+        String action = intent.getAction();
+        if (!Intent.ACTION_VIEW.equals(action) && !Intent.ACTION_SEND.equals(action)) return;
+        Uri uri = externalUri(intent);
+        Intent consumed = new Intent(intent); consumed.setAction(null); consumed.setData(null); consumed.removeExtra(Intent.EXTRA_STREAM); consumed.setClipData(null); setIntent(consumed);
+        if (uri == null) { toast("没有可导入的文件"); return; }
+        try {
+            String name = displayName(uri);
+            if (name == null || !name.toLowerCase(Locale.ROOT).endsWith(".pwh")) { toast("只能直接导入 .pwh 文件"); return; }
+            byte[] bytes=read(uri);if(bytes.length<5||bytes[0]!='p'||bytes[1]!='w'||bytes[2]!='h'||(bytes[3]&255)!=0x1f||(bytes[4]&255)!=0x8b){toast("文件扩展名是 .pwh，但内容不是有效 PWH");return;}importPwhBytes(bytes);
+        } catch (SecurityException e) { toast("无法读取该文件，请重新分享或打开"); }
+        catch (Exception e) { toast(e.getMessage()); }
+    }
+
+    private Uri externalUri(Intent intent) {
+        if (Intent.ACTION_VIEW.equals(intent.getAction())) return intent.getData();
+        if (intent.getClipData() != null && intent.getClipData().getItemCount() > 1) return null;
+        Uri uri;
+        if (Build.VERSION.SDK_INT >= 33) uri = intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class);
+        else uri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+        if (uri == null && intent.getClipData() != null && intent.getClipData().getItemCount() == 1) uri = intent.getClipData().getItemAt(0).getUri();
+        return uri;
+    }
+
+    private String displayName(Uri uri) {
+        if ("file".equalsIgnoreCase(uri.getScheme())) return new File(uri.getPath()).getName();
+        try (Cursor cursor = getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) { int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME); if (index >= 0) return cursor.getString(index); }
+        }
+        return null;
+    }
+
     private void open(int req,String type){ Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT); i.addCategory(Intent.CATEGORY_OPENABLE); i.setType(type); startActivityForResult(i,req); }
     private void create(int req,String name){ Intent i=new Intent(Intent.ACTION_CREATE_DOCUMENT); i.addCategory(Intent.CATEGORY_OPENABLE); i.setType("application/octet-stream"); i.putExtra(Intent.EXTRA_TITLE,name); startActivityForResult(i,req); }
-    private byte[] read(Uri u) throws IOException { try(InputStream in=getContentResolver().openInputStream(u)){ return in.readAllBytes(); } }
+    private byte[] read(Uri u) throws IOException { try(InputStream in=getContentResolver().openInputStream(u)){ if(in==null)throw new IOException("无法读取该文件"); return readAll(in); } }
+    private byte[] readAll(InputStream in) throws IOException { ByteArrayOutputStream out=new ByteArrayOutputStream(); byte[] buffer=new byte[8192]; int count; while((count=in.read(buffer))!=-1)out.write(buffer,0,count); return out.toByteArray(); }
     private void write(Uri u, byte[] b) throws IOException { try(OutputStream out=getContentResolver().openOutputStream(u)){ out.write(b); } }
 
     private LinearLayout row(int gravity) { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.HORIZONTAL); l.setGravity(gravity); return l; }
@@ -559,7 +890,7 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
     private record LocaleChoice(String label,String tag){ public String toString(){return label;} }
     private record ColorSchemeChoice(String label,String scheme){ public String toString(){return label;} }
     private record TextModeChoice(String label,String mode){ public String toString(){return label;} }
-    private final class OptionDraft { final String id; String textValue="", trueValue="", fakeValue=""; EditText text,trueWeight,fakeWeight; OptionDraft(){id=Models.newId();} OptionDraft(String label){id=Models.newId();textValue=label;} OptionDraft(WheelOption o){id=o.id;textValue=o.text;trueValue=String.valueOf(o.trueWeight);fakeValue=o.fakeWeight==null?"":String.valueOf(o.fakeWeight);} void capture(){textValue=text.getText().toString();trueValue=trueWeight.getText().toString();fakeValue=fakeWeight.getText().toString();} private double w(String v,double def){if(v==null||v.trim().isEmpty())return def; try{return Double.parseDouble(v.trim());}catch(Exception e){return def;} } String validate(){capture(); if(textValue.trim().isEmpty())return "名字不能为空"; double tv=w(trueValue,1); if(!Double.isFinite(tv)||tv<=0)return "真权重必须是大于 0 的有限数字"; if(!fakeValue.trim().isEmpty()){double fv=w(fakeValue,1); if(!Double.isFinite(fv)||fv<=0)return "显示权重必须是大于 0 的有限数字";} return null;} WheelOption toOption(){WheelOption o=new WheelOption();o.id=id;o.text=textValue.trim();o.trueWeight=w(trueValue,1);o.fakeWeight=fakeValue.trim().isEmpty()?null:w(fakeValue,1);return o;} }
+    private final class OptionDraft { final String id; String textValue="", trueValue="", fakeValue="";boolean hiddenValue; EditText text,trueWeight,fakeWeight; OptionDraft(){id=Models.newId();} OptionDraft(String label){id=Models.newId();textValue=label;} OptionDraft(String id,String text,String trueValue,String fakeValue,boolean hidden){this.id=id;this.textValue=text;this.trueValue=trueValue;this.fakeValue=fakeValue;this.hiddenValue=hidden;} OptionDraft(WheelOption o){id=o.id;textValue=o.text;trueValue=String.valueOf(o.trueWeight);fakeValue=o.fakeWeight==null?"":String.valueOf(o.fakeWeight);hiddenValue=o.hidden;} void capture(){if(text==null)return;textValue=text.getText().toString();trueValue=trueWeight.getText().toString();fakeValue=fakeWeight.getText().toString();} Double parse(String v,Double def){if(v==null||v.trim().isEmpty())return def;try{double n=Double.parseDouble(v.trim());return Double.isFinite(n)&&n>=0?n:null;}catch(Exception e){return null;}} String validate(){capture();if(textValue.trim().isEmpty())return "名字不能为空";Double tv=parse(trueValue,1.0);if(tv==null)return "真权重必须是大于等于 0 的有限数字";Double fv=fakeValue.trim().isEmpty()?null:parse(fakeValue,null);if(!fakeValue.trim().isEmpty()&&fv==null)return "显示权重必须是大于等于 0 的有限数字";if(tv==0||(fv!=null&&fv==0))hiddenValue=true;return null;} WheelOption toOption(){WheelOption o=new WheelOption();o.id=id;o.text=textValue.trim();Double tv=parse(trueValue,1.0),fv=fakeValue.trim().isEmpty()?null:parse(fakeValue,null);o.trueWeight=tv==null?1:tv;o.fakeWeight=fv;o.hidden=hiddenValue||o.trueWeight==0||o.displayWeight()==0;return o;} }
 
     private void seed(){ if(!library.wheels.isEmpty())return; Wheel w=applyAppDefaults(new Wheel()); w.name="今天吃什么"; w.options.add(new WheelOption("火锅",1,null)); w.options.add(new WheelOption("烤肉",2,null)); w.options.add(new WheelOption("米饭",1,null)); w.options.add(new WheelOption("面",1,null)); library.wheels.add(w); selectedWheel=w; }
     private void load(){ try{ String s=getPreferences(0).getString("library",null); if(s!=null) library=WheelFormats.importWwd(s.getBytes(StandardCharsets.UTF_8)); }catch(Exception ignored){} }
@@ -567,31 +898,46 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
 
     private final class WheelView extends View {
         Wheel wheel; double rotation; boolean spinning; String last; long lastTick;
+        Runnable activeSpinFrame;
+        long nextSpinId, activeSpinId;
         WheelView(Context c){ super(c); setBackgroundColor(Color.TRANSPARENT); }
         void setWheel(Wheel w){ wheel=w; invalidate(); }
-        void spin(SpinEngine.SpinPlan plan, java.util.function.Consumer<WheelOption> pass, Runnable done){ spinning=true; last=null; lastTick=0; rotation=normalizeRotation(rotation); final long start=SystemClock.elapsedRealtimeNanos(); double from=rotation,to=rotation+plan.totalRotation(); postOnAnimation(new Runnable(){ public void run(){ double elapsedMs=(SystemClock.elapsedRealtimeNanos()-start)/1_000_000.0; double t=Math.min(1,elapsedMs/plan.durationMs()); double eased=1-Math.pow(1-t,3); rotation=from+(to-from)*eased; WheelOption cur=engine.optionAtPointer(wheel,rotation); long now=SystemClock.elapsedRealtime(); if(cur!=null&&!Objects.equals(cur.id,last)&&now-lastTick>50){last=cur.id;lastTick=now;pass.accept(cur);} invalidate(); if(t<1)postOnAnimation(this); else{rotation=normalizeRotation(to);spinning=false;invalidate();done.run();}}}); }
+        long spin(SpinEngine.SpinPlan plan, java.util.function.Consumer<WheelOption> pass, Runnable done){
+            cancelSpin(activeSpinId);
+            spinning=true; last=null; lastTick=0; rotation=normalizeRotation(rotation);
+            final long spinId=++nextSpinId, start=SystemClock.elapsedRealtimeNanos();
+            activeSpinId=spinId;
+            double from=rotation,to=rotation+plan.totalRotation();
+            activeSpinFrame=new Runnable(){ public void run(){
+                if(!spinning||activeSpinId!=spinId||activeSpinFrame!=this)return;
+                double elapsedMs=(SystemClock.elapsedRealtimeNanos()-start)/1_000_000.0;
+                double t=Math.min(1,elapsedMs/plan.durationMs());
+                rotation=SpinEngine.rotationAt(from,plan,elapsedMs);
+                WheelOption cur=engine.optionAtPointer(wheel,rotation);
+                long now=SystemClock.elapsedRealtime();
+                if(cur!=null&&!Objects.equals(cur.id,last)&&now-lastTick>50){last=cur.id;lastTick=now;pass.accept(cur);}
+                invalidate();
+                if(t<1)postOnAnimation(this);
+                else{
+                    rotation=normalizeRotation(to); spinning=false; activeSpinFrame=null; activeSpinId=0; last=null; lastTick=0; invalidate(); done.run();
+                }
+            }};
+            postOnAnimation(activeSpinFrame);
+            return spinId;
+        }
+        long currentSpinId(){ return spinning?activeSpinId:0; }
+        boolean cancelSpin(long expectedSpinId){
+            if(!spinning||expectedSpinId==0||activeSpinId!=expectedSpinId)return false;
+            if(activeSpinFrame!=null)removeCallbacks(activeSpinFrame);
+            rotation=normalizeRotation(rotation); spinning=false; activeSpinFrame=null; activeSpinId=0; last=null; lastTick=0; invalidate();
+            return true;
+        }
+        protected void onDetachedFromWindow(){
+            if(activeSpinFrame!=null)removeCallbacks(activeSpinFrame);
+            spinning=false; activeSpinFrame=null; activeSpinId=0; last=null; lastTick=0;
+            super.onDetachedFromWindow();
+        }
         private double normalizeRotation(double value){ value%=360.0; return value<0?value+360.0:value; }
-        protected void onDraw(Canvas c){ super.onDraw(c); Paint p=new Paint(Paint.ANTI_ALIAS_FLAG); int size=Math.min(getWidth(),getHeight())-dp(48), x=(getWidth()-size)/2, y=(getHeight()-size)/2; if(wheel==null){p.setTextSize(dp(18));p.setColor(sub);p.setTextAlign(Paint.Align.CENTER);c.drawText("请先新建转盘",getWidth()/2f,getHeight()/2f,p);return;} int[] cs=colors(wheel.settings.colorScheme); RectF oval=new RectF(x,y,x+size,y+size); java.util.List<SpinEngine.Segment> segs=engine.segments(wheel); drawSectors(c,p,oval,segs,cs); drawLabels(c,p,x,y,size,segs); drawRimPointerAndHub(c,p,oval,y); }
-        private void drawSectors(Canvas c, Paint p, RectF oval, java.util.List<SpinEngine.Segment> segs, int[] cs){ p.setStyle(Paint.Style.FILL); for(int i=0;i<segs.size();i++){ SpinEngine.Segment s=segs.get(i); p.setColor(cs[i%cs.length]); c.drawArc(oval,(float)(s.startAngle()+rotation),(float)s.sweepAngle(),true,p); } float cx=oval.centerX(),cy=oval.centerY(),r=oval.width()/2f; p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(dp(2)); p.setColor(0x99ffffff); for(SpinEngine.Segment s:segs){ double rad=Math.toRadians(s.startAngle()+rotation); c.drawLine(cx,cy,cx+(float)Math.cos(rad)*r,cy+(float)Math.sin(rad)*r,p); } }
-        private void drawLabels(Canvas c, Paint p, int x, int y, int size, java.util.List<SpinEngine.Segment> segs){ p.setStyle(Paint.Style.FILL); p.setColor(0xff111827); p.setTypeface(Typeface.DEFAULT_BOLD); String mode=WheelTextLayout.normalizeTextDisplayMode(library.settings.textDisplayMode); for(SpinEngine.Segment s:segs){ if("radial".equals(mode)) drawRadialLabel(c,p,x,y,size,s); else drawFloatingLabel(c,p,x,y,size,s); } }
-        private void drawFloatingLabel(Canvas c, Paint p, int x, int y, int size, SpinEngine.Segment s){ float textSize=wheel.settings.fontSize*getResources().getDisplayMetrics().scaledDensity; p.setTextSize(textSize); p.setTextAlign(Paint.Align.CENTER); double mid=Math.toRadians(s.startAngle()+s.sweepAngle()/2+rotation); float maxWidth=(float)Math.max(dp(24), size*Math.sin(Math.toRadians(Math.max(2, s.sweepAngle()))/2.0)*0.72); WheelTextLayout.LabelLayout label=WheelTextLayout.floatingLabel(s.option().text,maxWidth,textSize,library.settings.ellipsizeText,(txt,value)->{ p.setTextSize(value); return p.measureText(txt); }); if(!label.draw)return; p.setTextSize(label.textSize); Paint.FontMetrics fm=p.getFontMetrics(); float baseline=(float)(y+size/2+Math.sin(mid)*size*.27-(fm.ascent+fm.descent)/2); c.drawText(label.text,(float)(x+size/2+Math.cos(mid)*size*.27),baseline,p); }
-        private void drawRadialLabel(Canvas c, Paint p, int x, int y, int size, SpinEngine.Segment s){ float base=wheel.settings.fontSize*getResources().getDisplayMetrics().scaledDensity; float min=Math.max(dp(8),base*0.58f); float maxWidth=size*0.39f; WheelTextLayout.LabelLayout label=WheelTextLayout.radialLabel(s.option().text,base,min,maxWidth,s.sweepAngle(),library.settings.radialTextAutoSize,library.settings.ellipsizeText,(txt,value)->{ p.setTextSize(value); return p.measureText(txt); }); if(!label.draw)return; p.setTextSize(label.textSize); p.setTextAlign(Paint.Align.LEFT); float cx=x+size/2f, cy=y+size/2f, start=size*0.13f; Paint.FontMetrics fm=p.getFontMetrics(); float baseline=-(fm.ascent+fm.descent)/2; c.save(); c.rotate((float)(s.startAngle()+s.sweepAngle()/2+rotation),cx,cy); c.drawText(label.text,cx+start,cy+baseline,p); c.restore(); }
-        private void drawRimPointerAndHub(Canvas c, Paint p, RectF oval, int y) {
-        p.setStyle(Paint.Style.STROKE); p.setStrokeWidth(dp(4)); p.setColor(0xffffffff); c.drawOval(oval, p);
-        p.setStyle(Paint.Style.FILL); p.setColor(0xffffffff);
-        float cx = getWidth() / 2f, cy = getHeight() / 2f;
-        int hubR = Math.max(dp(14), (int) (oval.width() * 0.065f));
-        // Pointer extends above the hub so it's visible against wheel sectors
-        float ptrH = hubR * 0.4f, ptrW = hubR * 0.35f;
-        Path ptr = new Path();
-        ptr.moveTo(cx, cy - hubR - ptrH);            // top tip (above hub)
-        ptr.lineTo(cx - ptrW, cy - hubR + dp(2));      // bottom-left
-        ptr.lineTo(cx + ptrW, cy - hubR + dp(2));      // bottom-right
-        ptr.close();
-        c.drawPath(ptr, p);
-        // Hub circle drawn AFTER (on top of) pointer base
-        c.drawCircle(cx, cy, hubR, p);
-    }
-        private int[] colors(String s){ s=WheelFormats.normalizeColorScheme(s); if("pastel".equals(s))return new int[]{0xffffb3ba,0xffffdfba,0xffffffba,0xffbaffc9,0xffbae1ff}; if("vivid".equals(s))return new int[]{0xffff5252,0xffffc107,0xff22c55e,0xff06b6d4,0xffd946ef}; if("mono".equals(s))return new int[]{0xffeeeeee,0xffbbbbbb,0xff888888,0xff555555}; return new int[]{0xffffb703,0xfffb8500,0xff8ecae6,0xff219ebc,0xffff006e,0xff8338ec}; }
+        protected void onDraw(Canvas c){ super.onDraw(c); Paint p=new Paint(Paint.ANTI_ALIAS_FLAG); int size=Math.min(getWidth(),getHeight())-dp(48), x=(getWidth()-size)/2, y=(getHeight()-size)/2; if(wheel==null){p.setTextSize(dp(18));p.setColor(sub);p.setTextAlign(Paint.Align.CENTER);c.drawText("请先新建转盘",getWidth()/2f,getHeight()/2f,p);return;}WheelCanvasRenderer.draw(c,new RectF(x,y,x+size,y+size),wheel,library.settings,engine,rotation,getResources().getDisplayMetrics().density,getResources().getDisplayMetrics().scaledDensity); }
     }
 }

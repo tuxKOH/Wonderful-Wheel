@@ -3,6 +3,7 @@ package com.wheel.app.format;
 import static org.junit.Assert.*;
 
 import com.wheel.app.model.Models.AppSettings;
+import com.wheel.app.model.Models.SpinHistoryEntry;
 import com.wheel.app.model.Models.Wheel;
 import com.wheel.app.model.Models.WheelLibrary;
 import com.wheel.app.model.Models.WheelOption;
@@ -81,5 +82,43 @@ public class WheelFormatsTest {
         assertFalse(imported.settings.ellipsizeText);
         assertEquals("floating", imported.wheels.get(0).settings.textDisplayMode);
         assertFalse(imported.wheels.get(0).settings.radialTextAutoSize);
+    }
+
+    @Test
+    public void historyRoundTripsAndKeepsOrphans() throws Exception {
+        WheelLibrary library = new WheelLibrary();
+        Wheel wheel = new Wheel(); wheel.name = "Renamed"; wheel.options.add(new WheelOption("New", 1, null)); library.wheels.add(wheel);
+        SpinHistoryEntry entry = new SpinHistoryEntry(); entry.wheelId = wheel.id; entry.wheelName = "Old wheel"; entry.optionId = wheel.options.get(0).id; entry.optionText = "Old option"; entry.createdAt = 1234; library.history.add(entry);
+        SpinHistoryEntry orphan = new SpinHistoryEntry(); orphan.wheelId = "deleted"; orphan.wheelName = "Deleted"; orphan.optionText = "Result"; orphan.createdAt = 5678; library.history.add(orphan);
+
+        WheelLibrary imported = WheelFormats.importWwd(WheelFormats.exportWwd(library, false));
+
+        assertEquals(2, imported.history.size());
+        assertEquals("Old wheel", imported.history.get(0).wheelName);
+        assertEquals("Old option", imported.history.get(0).optionText);
+        assertEquals(1234, imported.history.get(0).createdAt);
+        assertEquals("deleted", imported.history.get(1).wheelId);
+    }
+
+    @Test
+    public void missingAndInvalidHistoryStayBackwardCompatible() throws Exception {
+        String json = "{\"format\":\"wwd\",\"version\":1,\"wheels\":[],\"history\":[null,{}, {\"wheelId\":\"w\",\"optionText\":\"Result\",\"createdAt\":9}]}";
+
+        WheelLibrary imported = WheelFormats.importWwd(json.getBytes(StandardCharsets.UTF_8));
+
+        assertEquals(1, imported.history.size());
+        assertEquals("Result", imported.history.get(0).optionText);
+        assertEquals(9, imported.history.get(0).createdAt);
+        assertTrue(WheelFormats.importWwd("{\"format\":\"wwd\",\"version\":1}".getBytes(StandardCharsets.UTF_8)).history.isEmpty());
+    }
+
+    @Test
+    public void pwhRejectsMissingMagic() {
+        try {
+            WheelFormats.importPwh("not-pwh".getBytes(StandardCharsets.UTF_8), null);
+            fail("Expected IOException");
+        } catch (java.io.IOException expected) {
+            assertTrue(expected.getMessage().contains("pwh"));
+        }
     }
 }
