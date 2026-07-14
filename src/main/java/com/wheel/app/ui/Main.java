@@ -248,7 +248,7 @@ public final class Main {
 
     private void importPwh(ActionEvent e) { importFile("pwh", file -> WheelFormats.importPwh(Files.readAllBytes(file.toPath()), selectedGroupId).forEach(w -> { w.name = library.uniqueWheelName(w.name); library.wheels.add(w); })); }
     private void importWwd(ActionEvent e) { importFile("wwd/json", file -> { WheelLibrary imported = WheelFormats.importWwd(Files.readAllBytes(file.toPath())); mergeWwd(imported); }); }
-    private void exportPwh(ActionEvent e) { exportFile("pwh", "export.pwh", file -> Files.write(file.toPath(), WheelFormats.exportPwh(selectedWheel == null ? library.wheels : List.of(selectedWheel)))); }
+    private void exportPwh(ActionEvent e) { exportFile("pwh", "export.pwh", file -> Files.write(file.toPath(), WheelFormats.exportPwh(library.wheels))); }
     private void exportWwd(ActionEvent e) { exportFile("wwd", "export.wwd", file -> Files.write(file.toPath(), WheelFormats.exportWwd(library, false))); }
 
     private void mergeWwd(WheelLibrary imported) {

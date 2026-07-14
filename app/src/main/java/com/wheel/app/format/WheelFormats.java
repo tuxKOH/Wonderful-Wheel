@@ -48,17 +48,12 @@ public final class WheelFormats {
 
     public static byte[] exportPwh(List<Wheel> wheels) throws IOException {
         Map<String, Object> root = new LinkedHashMap<>();
-        root.put("exportTime", System.currentTimeMillis());
-        root.put("version", 5);
         List<Object> outWheels = new ArrayList<>();
-        int dbId = 1;
         for (Wheel wheel : wheels) {
             Map<String, Object> wm = new LinkedHashMap<>();
-            wm.put("dbId", dbId++);
             wm.put("title", wheel.name);
             List<Object> items = new ArrayList<>();
             for (WheelOption option : wheel.options) {
-                if(option.hidden||option.trueWeight<=0||option.displayWeight()<=0)continue;
                 Map<String, Object> im = new LinkedHashMap<>();
                 im.put("text", option.text);
                 im.put("weight", option.trueWeight);

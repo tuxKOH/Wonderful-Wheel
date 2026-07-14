@@ -121,4 +121,17 @@ public class WheelFormatsTest {
             assertTrue(expected.getMessage().contains("pwh"));
         }
     }
+
+    @Test
+    public void pwhExportContainsOnlyPortableWheelData() throws Exception {
+        Wheel first = new Wheel(); first.name = "First"; first.groupId = "private-group";
+        WheelOption hidden = new WheelOption("Hidden too", 0, 99.0); hidden.hidden = true; first.options.add(hidden);
+        Wheel second = new Wheel(); second.name = "Second"; second.options.add(new WheelOption("B", 2, null));
+        byte[] raw = WheelFormats.exportPwh(java.util.List.of(first, second));
+        assertEquals(2, WheelFormats.importPwh(raw, null).size());
+        java.io.ByteArrayInputStream bytes = new java.io.ByteArrayInputStream(raw, 3, raw.length - 3);
+        String json = new String(new java.util.zip.GZIPInputStream(bytes).readAllBytes(), StandardCharsets.UTF_8);
+        assertFalse(json.contains("exportTime")); assertFalse(json.contains("version")); assertFalse(json.contains("dbId"));
+        assertFalse(json.contains("private-group")); assertFalse(json.contains("fakeWeight")); assertTrue(json.contains("Hidden too"));
+    }
 }
