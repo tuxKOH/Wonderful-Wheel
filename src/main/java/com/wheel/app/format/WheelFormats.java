@@ -14,25 +14,33 @@ public final class WheelFormats {
     private WheelFormats() {}
 
     public static List<Wheel> importPwh(byte[] raw, String groupId) throws IOException {
-        if (raw.length < 4 || raw[0] != 'p' || raw[1] != 'w' || raw[2] != 'h') {
-            throw new IOException("不是有效的 PWH 文件：缺少 pwh 头部");
-        }
-        String json;
-        try (GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(raw, 3, raw.length - 3))) {
-            json = new String(in.readAllBytes(), StandardCharsets.UTF_8);
-        }
+        return importPwhBatch(raw, groupId, 0, Integer.MAX_VALUE);
+    }
+
+    public static int pwhWheelCount(byte[] raw) throws IOException {
+        Object root = SimpleJson.parse(decodePwh(raw));
+        if (!(root instanceof Map<?, ?> map) || !(map.get("wheels") instanceof List<?> wheels)) throw new IOException("PWH JSON 缺少 wheels 数组");
+        return wheels.size();
+    }
+
+    public static List<Wheel> importPwhBatch(byte[] raw, String groupId, int start, int limit) throws IOException {
+        String json = decodePwh(raw);
         Object root = SimpleJson.parse(json);
         if (!(root instanceof Map<?, ?> map)) throw new IOException("PWH JSON 顶层不是对象");
         Object wheelsObj = map.get("wheels");
         if (!(wheelsObj instanceof List<?> wheelList)) throw new IOException("PWH JSON 缺少 wheels 数组");
         List<Wheel> result = new ArrayList<>();
+        int validIndex = 0;
+        int end = Math.max(start, start + Math.max(0, limit));
         for (Object wObj : wheelList) {
             if (!(wObj instanceof Map<?, ?> wm)) continue;
+            Object itemsObj = wm.get("items");
+            if (!(itemsObj instanceof List<?> items)) continue;
+            if (validIndex < start || validIndex >= end) { validIndex++; continue; }
             Wheel wheel = new Wheel();
             wheel.name = str(wm.get("title"), "Untitled");
             wheel.groupId = groupId;
-            Object itemsObj = wm.get("items");
-            if (itemsObj instanceof List<?> items) {
+            {
                 for (Object itemObj : items) {
                     if (!(itemObj instanceof Map<?, ?> im)) continue;
                     String text = str(im.get("text"), "").trim();
@@ -42,8 +50,14 @@ public final class WheelFormats {
                 }
             }
             if (!wheel.options.isEmpty()) result.add(wheel);
+            validIndex++;
         }
         return result;
+    }
+
+    private static String decodePwh(byte[] raw) throws IOException {
+        if (raw.length < 4 || raw[0] != 'p' || raw[1] != 'w' || raw[2] != 'h') throw new IOException("不是有效的 PWH 文件：缺少 pwh 头部");
+        try (GZIPInputStream in = new GZIPInputStream(new ByteArrayInputStream(raw, 3, raw.length - 3))) { return new String(in.readAllBytes(), StandardCharsets.UTF_8); }
     }
 
     public static byte[] exportPwh(List<Wheel> wheels) throws IOException {

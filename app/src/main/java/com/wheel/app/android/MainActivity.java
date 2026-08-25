@@ -70,6 +70,13 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
     private String editorNameDraft = "", batchText = "";
     private ArrayList<OptionDraft> editorDrafts;
     private ArrayList<Wheel> pendingPwhWheels;
+    private byte[] pendingPwhRaw;
+    private int pendingPwhTotal, pendingPwhOffset, pendingPwhBatchSize;
+    private ArrayList<Wheel> pendingPwhCommitWheels;
+    private int pendingPwhCommitOffset;
+    private AlertDialog pwhImportProgress;
+    private ProgressBar pwhProgressBar;
+    private TextView pwhProgressText;
     private final HashSet<Integer> pendingPwhSelection = new HashSet<>();
     private TextToSpeech tts;
     private boolean ttsReady;
@@ -832,8 +839,10 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
 
     private void setPendingPwhRow(LinearLayout list,int index,boolean selected){if(selected)pendingPwhSelection.add(index);else pendingPwhSelection.remove(index);View child=list.getChildAt(index);if(child==null)return;CheckBox check=(CheckBox)((LinearLayout)child).getChildAt(0);check.setChecked(selected);child.setBackground(round(selected?0xff24334d:DARK_PANEL,dp(12),selected?BLUE:0xff263244,1));}
     private void assignSelectedPwh(String groupId){for(int i:pendingPwhSelection)if(i>=0&&i<pendingPwhWheels.size())pendingPwhWheels.get(i).groupId=groupId;}
-    private void finishPwhImport(){if(pendingPwhWheels==null)return;for(Wheel w:pendingPwhWheels){applyAppDefaults(w);w.name=library.uniqueWheelName(w.name);library.wheels.add(w);selectedWheel=w;}int count=pendingPwhWheels.size();pendingPwhWheels=null;pendingPwhSelection.clear();save();currentScreen=Screen.LIST;renderCurrentScreen();toast("已导入 "+count+" 个转盘");}
-    private void cancelPwhImport(){pendingPwhWheels=null;pendingPwhSelection.clear();currentScreen=Screen.MAIN;renderCurrentScreen();}
+    private void finishPwhImport(){if(pendingPwhWheels==null)return;pendingPwhCommitWheels=new ArrayList<>();for(int i=0;i<pendingPwhWheels.size();i++)if(pendingPwhSelection.contains(i))pendingPwhCommitWheels.add(pendingPwhWheels.get(i));pendingPwhCommitOffset=0;pendingPwhWheels=null;pendingPwhSelection.clear();showPwhImportProgress();commitNextPwhBatch();}
+    private void showPwhImportProgress(){LinearLayout box=new LinearLayout(this);box.setOrientation(LinearLayout.VERTICAL);box.setPadding(dp(24),dp(8),dp(24),dp(8));pwhProgressText=label("准备导入…",14,text,false);box.addView(pwhProgressText);pwhProgressBar=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);pwhProgressBar.setMax(Math.max(1,pendingPwhCommitWheels.size()));pwhProgressBar.setProgress(0);box.addView(pwhProgressBar,new LinearLayout.LayoutParams(-1,dp(24)));pwhImportProgress=new AlertDialog.Builder(this).setTitle("正在导入 PWH").setView(box).setCancelable(false).create();pwhImportProgress.show();}
+    private void commitNextPwhBatch(){if(pendingPwhCommitWheels==null)return;int end=Math.min(pendingPwhCommitOffset+50,pendingPwhCommitWheels.size());for(int i=pendingPwhCommitOffset;i<end;i++){Wheel w=pendingPwhCommitWheels.get(i);applyAppDefaults(w);w.name=library.uniqueWheelName(w.name);library.wheels.add(w);selectedWheel=w;}pendingPwhCommitOffset=end;save();if(pwhProgressBar!=null){pwhProgressBar.setProgress(end);pwhProgressText.setText("已导入 "+end+" / "+pendingPwhCommitWheels.size());}if(end<pendingPwhCommitWheels.size()){new Handler(Looper.getMainLooper()).postDelayed(this::commitNextPwhBatch,32);return;}int count=pendingPwhCommitWheels.size();pendingPwhCommitWheels=null;pendingPwhRaw=null;pendingPwhTotal=0;pendingPwhOffset=0;if(pwhImportProgress!=null){pwhImportProgress.dismiss();pwhImportProgress=null;}currentScreen=Screen.LIST;renderCurrentScreen();toast("已导入 "+count+" 个转盘");}
+    private void cancelPwhImport(){pendingPwhWheels=null;pendingPwhCommitWheels=null;pendingPwhRaw=null;pendingPwhTotal=0;pendingPwhOffset=0;pendingPwhSelection.clear();if(pwhImportProgress!=null){pwhImportProgress.dismiss();pwhImportProgress=null;}currentScreen=Screen.MAIN;renderCurrentScreen();}
 
     private void mergeWwd(WheelLibrary imported) {
         HashSet<String> usedGroupIds = new HashSet<>();
